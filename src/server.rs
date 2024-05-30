@@ -223,7 +223,7 @@ pub struct Incoming<'a, A: Authentication>(
 /// Iterator for each incoming stream connection
 /// this wrapper will convert async_std TcpStream into Socks5Socket.
 impl<'a, A: Authentication> Stream for Incoming<'a, A> {
-    type Item = Result<Socks5Socket<TcpStream, A>>;
+    type Item = Result<Socks5Socket<TcpStream, A, TcpStream>>;
 
     /// this code is mainly borrowed from [`Incoming::poll_next()` of `TcpListener`][tcpListenerLink]
     ///
@@ -254,9 +254,13 @@ impl<'a, A: Authentication> Stream for Incoming<'a, A> {
     }
 }
 
+pub type SocketGenerator<S> = Box<dyn Fn(SocketAddr) -> Pin<Box<dyn Future<Output = Result<S>> + Send>> + Send>;
+
 /// Wrap TcpStream and contains Socks5 protocol implementation.
-pub struct Socks5Socket<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> {
+pub struct Socks5Socket<T,A,U>
+where T: AsyncRead + AsyncWrite + Unpin, A: Authentication, U: AsyncRead + AsyncWrite + Unpin {
     inner: T,
+    sock_gen: SocketGenerator<U>,
     config: Arc<Config<A>>,
     auth: AuthenticationMethod,
     target_addr: Option<TargetAddr>,
@@ -268,10 +272,28 @@ pub struct Socks5Socket<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> {
     credentials: Option<A::Item>,
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
-    pub fn new(socket: T, config: Arc<Config<A>>) -> Self {
+impl<A: Authentication> Socks5Socket<TcpStream, A, TcpStream> {
+    pub fn new(socket: TcpStream, config: Arc<Config<A>>) -> Self {
+        let timeout = config.request_timeout;
         Socks5Socket {
             inner: socket,
+            sock_gen: Box::new(move |a| Box::pin(tcp_connect_with_timeout(a, timeout))),
+            config,
+            auth: AuthenticationMethod::None,
+            target_addr: None,
+            cmd: None,
+            reply_ip: None,
+            credentials: None,
+        }
+    }
+}
+
+impl<T,A,U> Socks5Socket<T, A, U>
+where T: AsyncRead + AsyncWrite + Unpin, A: Authentication, U: AsyncRead + AsyncWrite + Unpin {
+    pub fn new_with_gen(socket: T, sock_gen: SocketGenerator<U>, config: Arc<Config<A>>) -> Self {
+        Socks5Socket {
+            inner: socket,
+            sock_gen,
             config,
             auth: AuthenticationMethod::None,
             target_addr: None,
@@ -298,7 +320,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
 
     /// Process clients SOCKS requests
     /// This is the entry point where a whole request is processed.
-    pub async fn upgrade_to_socks5(mut self) -> Result<Socks5Socket<T, A>> {
+    pub async fn upgrade_to_socks5(mut self) -> Result<Socks5Socket<T, A, U>> {
         trace!("upgrading to socks5...");
 
         // Handshake
@@ -659,7 +681,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
             .context("unreachable")?;
 
         // TCP connect with timeout, to avoid memory leak for connection that takes forever
-        let outbound = tcp_connect_with_timeout(addr, self.config.request_timeout).await?;
+        let outbound = (self.sock_gen)(addr).await?;
 
         debug!("Connected to remote destination");
 
@@ -810,12 +832,14 @@ async fn transfer_udp(inbound: UdpSocket) -> Result<()> {
 // Fixes the issue "cannot borrow data in dereference of `Pin<&mut >` as mutable"
 //
 // cf. https://users.rust-lang.org/t/take-in-impl-future-cannot-borrow-data-in-a-dereference-of-pin/52042
-impl<T, A: Authentication> Unpin for Socks5Socket<T, A> where T: AsyncRead + AsyncWrite + Unpin {}
+impl<T, A: Authentication, U> Unpin for Socks5Socket<T, A, U>
+    where T: AsyncRead + AsyncWrite + Unpin, U: AsyncRead + AsyncWrite + Unpin {}
 
 /// Allow us to read directly from the struct
-impl<T, A: Authentication> AsyncRead for Socks5Socket<T, A>
+impl<T, A: Authentication, U> AsyncRead for Socks5Socket<T, A, U>
 where
     T: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin
 {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -827,9 +851,10 @@ where
 }
 
 /// Allow us to write directly into the struct
-impl<T, A: Authentication> AsyncWrite for Socks5Socket<T, A>
+impl<T, A: Authentication, U> AsyncWrite for Socks5Socket<T, A, U>
 where
     T: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin
 {
     fn poll_write(
         mut self: Pin<&mut Self>,

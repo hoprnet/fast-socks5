@@ -2,11 +2,9 @@
 #[macro_use]
 extern crate log;
 
-use fast_socks5::{
-    server::{Authentication, Config, SimpleUserPassword, Socks5Socket},
-    Result,
-};
+use fast_socks5::{server::{Authentication, Config, SimpleUserPassword, Socks5Socket}, Result};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use structopt::StructOpt;
 use tokio::task;
@@ -14,6 +12,8 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpListener,
 };
+use fast_socks5::server::SocketGenerator;
+use fast_socks5::util::stream::tcp_connect_with_timeout;
 
 /// # How to use it:
 ///
@@ -76,6 +76,8 @@ async fn spawn_socks_server() -> Result<()> {
     let mut config = Config::default();
     config.set_request_timeout(opt.request_timeout);
 
+    let timeout = opt.request_timeout;
+
     let config = match opt.auth {
         AuthMode::NoAuth => {
             warn!("No authentication has been set!");
@@ -99,7 +101,9 @@ async fn spawn_socks_server() -> Result<()> {
         match listener.accept().await {
             Ok((socket, _addr)) => {
                 info!("Connection from {}", socket.peer_addr()?);
-                let socket = Socks5Socket::new(socket, config.clone());
+                let gen: SocketGenerator<tokio::net::TcpStream> = Box::new(move |a: SocketAddr| Box::pin(tcp_connect_with_timeout(a, timeout)));
+
+                let socket = Socks5Socket::<tokio::net::TcpStream,_, tokio::net::TcpStream>::new_with_gen(socket, gen, config.clone());
 
                 spawn_and_log_error(socket.upgrade_to_socks5());
             }
@@ -108,11 +112,12 @@ async fn spawn_socks_server() -> Result<()> {
     }
 }
 
-fn spawn_and_log_error<F, T, A>(fut: F) -> task::JoinHandle<()>
+fn spawn_and_log_error<F, T, A, U>(fut: F) -> task::JoinHandle<()>
 where
-    F: Future<Output = Result<Socks5Socket<T, A>>> + Send + 'static,
+    F: Future<Output = Result<Socks5Socket<T, A, U>>> + Send + 'static,
     T: AsyncRead + AsyncWrite + Unpin,
     A: Authentication,
+    U: AsyncRead + AsyncWrite + Unpin,
 {
     task::spawn(async move {
         if let Err(e) = fut.await {

@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use crate::{ReplyError, Result};
 use tokio::io::ErrorKind as IOErrorKind;
 use tokio::time::timeout;
@@ -45,9 +46,7 @@ macro_rules! ready {
     };
 }
 
-pub async fn tcp_connect_with_timeout<T>(addr: T, request_timeout_s: u64) -> Result<TcpStream>
-    where T: ToSocketAddrs,
-{
+pub async fn tcp_connect_with_timeout(addr: SocketAddr, request_timeout_s: u64) -> Result<TcpStream> {
     let fut = tcp_connect(addr);
     match timeout(Duration::from_secs(request_timeout_s), fut).await {
         Ok(result) => result,
